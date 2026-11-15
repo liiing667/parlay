@@ -17,8 +17,12 @@
 package ecosystems
 
 import (
+	"fmt"
+	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jarcoal/httpmock"
 	"github.com/package-url/packageurl-go"
@@ -153,8 +157,8 @@ func TestInMemoryCache_APIError(t *testing.T) {
 	httpmock.Activate()
 	defer httpmock.DeactivateAndReset()
 
-	// HTTP client returns a successful response even with 500 status
-	// So we need to test that the client properly handles this case
+	// 5xx responses must surface an error and must never be cached, so that
+	// transient upstream failures don't poison the process-level cache.
 	httpmock.RegisterResponder(
 		"GET",
 		`=~^https://packages.ecosyste.ms/api/v1/registries`,
@@ -165,22 +169,92 @@ func TestInMemoryCache_APIError(t *testing.T) {
 	purl, err := packageurl.FromString("pkg:npm/test-package@1.0.0")
 	require.NoError(t, err)
 
-	// HTTP client doesn't treat 500 as error
 	resp1, err := cache.GetPackageData(purl)
-	assert.NoError(t, err)
-	assert.Equal(t, 500, resp1.StatusCode())
+	assert.Error(t, err)
+	assert.Nil(t, resp1)
 
 	resp2, err := cache.GetPackageData(purl)
-	assert.NoError(t, err)
-	assert.Equal(t, 500, resp2.StatusCode())
-	assert.Equal(t, resp1, resp2)
+	assert.Error(t, err)
+	assert.Nil(t, resp2)
 
-	// Second call used cache
+	// 5xx responses are not cached: the second call retries upstream
 	callCount := httpmock.GetTotalCallCount()
-	assert.Equal(t, 1, callCount)
+	assert.Equal(t, 2, callCount)
 
 	pkgCacheSize, versionCacheSize := cache.GetCacheStats()
+	assert.Equal(t, 0, pkgCacheSize)
+	assert.Equal(t, 0, versionCacheSize)
+}
+
+func TestInMemoryCache_5xxNotCachedThenRecovers(t *testing.T) {
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+
+	// First the upstream fails with 503, then it recovers with a 200. The
+	// failure must not poison the cache: the retry should fetch fresh data.
+	var calls atomic.Int32
+	httpmock.RegisterResponder(
+		"GET",
+		`=~^https://packages.ecosyste.ms/api/v1/registries`,
+		func(req *http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return httpmock.NewStringResponse(503, `{"error": "service unavailable"}`), nil
+			}
+			resp := httpmock.NewStringResponse(200, `{"name": "test-package"}`)
+			resp.Header.Set("Content-Type", "application/json")
+			return resp, nil
+		},
+	)
+
+	cache := NewInMemoryCache()
+	purl, err := packageurl.FromString("pkg:npm/test-package@1.0.0")
+	require.NoError(t, err)
+
+	resp, err := cache.GetPackageData(purl)
+	assert.Error(t, err)
+	assert.Nil(t, resp)
+
+	resp, err = cache.GetPackageData(purl)
+	assert.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, 200, resp.StatusCode())
+	require.NotNil(t, resp.JSON200)
+
+	// The recovered 2xx response is now cached
+	resp2, err := cache.GetPackageData(purl)
+	assert.NoError(t, err)
+	assert.Equal(t, resp, resp2)
+	assert.Equal(t, int32(2), calls.Load())
+
+	pkgCacheSize, _ := cache.GetCacheStats()
 	assert.Equal(t, 1, pkgCacheSize)
+}
+
+func TestInMemoryCache_VersionData5xxNotCached(t *testing.T) {
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+
+	httpmock.RegisterResponder(
+		"GET",
+		`=~^https://packages.ecosyste.ms/api/v1/registries`,
+		httpmock.NewStringResponder(502, `{"error": "bad gateway"}`),
+	)
+
+	cache := NewInMemoryCache()
+	purl, err := packageurl.FromString("pkg:npm/test-package@1.0.0")
+	require.NoError(t, err)
+
+	resp, err := cache.GetPackageVersionData(purl)
+	assert.Error(t, err)
+	assert.Nil(t, resp)
+
+	resp, err = cache.GetPackageVersionData(purl)
+	assert.Error(t, err)
+	assert.Nil(t, resp)
+
+	assert.Equal(t, 2, httpmock.GetTotalCallCount())
+
+	_, versionCacheSize := cache.GetCacheStats()
 	assert.Equal(t, 0, versionCacheSize)
 }
 
@@ -208,15 +282,21 @@ func TestInMemoryCache_404NotFound(t *testing.T) {
 	resp2, err := cache.GetPackageData(purl)
 	assert.NoError(t, err)
 	assert.Equal(t, 404, resp2.StatusCode())
-	assert.Equal(t, resp1, resp2)
+	assert.Nil(t, resp2.JSON200)
 
 	// Second call should use cache - only 1 API call total
 	callCount := httpmock.GetTotalCallCount()
 	assert.Equal(t, 1, callCount, "Expected only 1 API call, but got %d. 404 responses should be cached.", callCount)
 
+	// 404s live in the bounded negative cache, not the positive cache
 	pkgCacheSize, versionCacheSize := cache.GetCacheStats()
-	assert.Equal(t, 1, pkgCacheSize)
+	assert.Equal(t, 0, pkgCacheSize)
 	assert.Equal(t, 0, versionCacheSize)
+
+	cache.mu.RLock()
+	negativeSize := len(cache.packageNotFound)
+	cache.mu.RUnlock()
+	assert.Equal(t, 1, negativeSize)
 }
 
 func TestInMemoryCache_404NotFoundVersionData(t *testing.T) {
@@ -242,15 +322,21 @@ func TestInMemoryCache_404NotFoundVersionData(t *testing.T) {
 	resp2, err := cache.GetPackageVersionData(purl)
 	assert.NoError(t, err)
 	assert.Equal(t, 404, resp2.StatusCode())
-	assert.Equal(t, resp1, resp2)
+	assert.Nil(t, resp2.JSON200)
 
 	// Second call should use cache - only 1 API call total
 	callCount := httpmock.GetTotalCallCount()
 	assert.Equal(t, 1, callCount, "Expected only 1 API call, but got %d. 404 responses should be cached.", callCount)
 
+	// 404s live in the bounded negative cache, not the positive cache
 	pkgCacheSize, versionCacheSize := cache.GetCacheStats()
 	assert.Equal(t, 0, pkgCacheSize)
-	assert.Equal(t, 1, versionCacheSize)
+	assert.Equal(t, 0, versionCacheSize)
+
+	cache.mu.RLock()
+	negativeSize := len(cache.packageVersionNotFound)
+	cache.mu.RUnlock()
+	assert.Equal(t, 1, negativeSize)
 }
 
 func TestInMemoryCache_ConcurrentAccess(t *testing.T) {
@@ -290,6 +376,120 @@ func TestInMemoryCache_ConcurrentAccess(t *testing.T) {
 	// Can't guarantee exactly 1 call due to race conditions, but should be significantly less than numGoroutines
 	callCount := httpmock.GetTotalCallCount()
 	assert.True(t, callCount >= 1 && callCount < numGoroutines)
+}
+
+func TestInMemoryCache_ConcurrentDuplicateRequestsCallUpstreamOnce(t *testing.T) {
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+
+	// A slow responder forces the concurrent requests to overlap, so
+	// de-duplication (not just fast caching) is what keeps the count at 1.
+	var calls atomic.Int32
+	httpmock.RegisterResponder(
+		"GET",
+		`=~^https://packages.ecosyste.ms/api/v1/registries`,
+		func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			time.Sleep(50 * time.Millisecond)
+			return httpmock.NewStringResponse(200, `{"name": "test-package"}`), nil
+		},
+	)
+
+	cache := NewInMemoryCache()
+	purl, err := packageurl.FromString("pkg:npm/test-package@1.0.0")
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := cache.GetPackageData(purl)
+			assert.NoError(t, err)
+			assert.NotNil(t, resp)
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int32(1), calls.Load(), "concurrent duplicate requests should only hit upstream once")
+}
+
+func TestInMemoryCache_BoundedPositiveCache(t *testing.T) {
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+
+	httpmock.RegisterResponder(
+		"GET",
+		`=~^https://packages.ecosyste.ms/api/v1/registries`,
+		httpmock.NewStringResponder(200, `{}`),
+	)
+
+	cache := NewInMemoryCache()
+	cache.maxEntries = 3
+
+	for i := 0; i < 10; i++ {
+		purl, err := packageurl.FromString(fmt.Sprintf("pkg:npm/package-%d@1.0.0", i))
+		require.NoError(t, err)
+		_, err = cache.GetPackageData(purl)
+		require.NoError(t, err)
+	}
+
+	pkgCacheSize, _ := cache.GetCacheStats()
+	assert.Equal(t, 3, pkgCacheSize, "positive cache must be bounded")
+}
+
+func TestInMemoryCache_BoundedNegativeCache(t *testing.T) {
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+
+	httpmock.RegisterResponder(
+		"GET",
+		`=~^https://packages.ecosyste.ms/api/v1/registries`,
+		httpmock.NewStringResponder(404, `{"error": "not found"}`),
+	)
+
+	cache := NewInMemoryCache()
+	cache.maxNegativeEntries = 2
+
+	for i := 0; i < 10; i++ {
+		purl, err := packageurl.FromString(fmt.Sprintf("pkg:npm/missing-%d@1.0.0", i))
+		require.NoError(t, err)
+		resp, err := cache.GetPackageData(purl)
+		require.NoError(t, err)
+		assert.Equal(t, 404, resp.StatusCode())
+	}
+
+	cache.mu.RLock()
+	negativeSize := len(cache.packageNotFound)
+	cache.mu.RUnlock()
+	assert.Equal(t, 2, negativeSize, "negative cache must be bounded")
+}
+
+func TestInMemoryCache_NegativeCacheHitSkipsUpstream(t *testing.T) {
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+
+	httpmock.RegisterResponder(
+		"GET",
+		`=~^https://packages.ecosyste.ms/api/v1/registries`,
+		httpmock.NewStringResponder(404, `{"error": "not found"}`),
+	)
+
+	cache := NewInMemoryCache()
+	purl, err := packageurl.FromString("pkg:npm/missing@1.0.0")
+	require.NoError(t, err)
+
+	resp1, err := cache.GetPackageData(purl)
+	require.NoError(t, err)
+	assert.Equal(t, 404, resp1.StatusCode())
+	assert.Nil(t, resp1.JSON200)
+
+	resp2, err := cache.GetPackageData(purl)
+	require.NoError(t, err)
+	assert.Equal(t, 404, resp2.StatusCode())
+	assert.Nil(t, resp2.JSON200)
+
+	assert.Equal(t, 1, httpmock.GetTotalCallCount())
 }
 
 func TestGetGlobalCache_Singleton(t *testing.T) {
